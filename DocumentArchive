@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import binascii
+import boto3, botocore
+import calendar
+import datetime
+import dateutil.parser
+import hashlib
+import itertools
+import json
+import os
+import pprint
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+
+try:
+	CONFIG = json.load(open(os.path.join(os.environ.get('HOME','.'), '.documentarchive.conf'), 'r'))
+except Exception as e:
+	print('Can\'t load config file {0}: {1}'.format(os.path.join(os.environ.get('HOME','.'), '.documentarchive.conf'), e))
+	print('Config format:')
+	print(json.dumps({
+		'bucket': 'bucket.for.archive',
+		'pastebucket': 'optional bucket for generating short urls, else: delete or set to null',
+		}, indent='\t'))
+	print()
+	sys.exit(1)
+
+s3session = boto3.Session()
+s3client = s3session.client('s3')
+s3 = s3session.resource('s3')
+
+def load_and_update_cache():
+	cache_object = s3.Bucket(CONFIG.bucket).Object('cache.json')
+	try:
+		cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
+	except s3client.exceptions.NoSuchKey:
+		print('Cache not found, creating.')
+		cache = {}
+
+	all_items = set()
+	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG.bucket))):
+		if '/' not in item['Key']:
+			continue # ignore cache.json, etc
+		all_items.add(item['Key'])
+		if item['Key'] in cache and cache[item['Key']]['_LastModified'] == item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ') and cache[item['Key']]['_ETag'] == item['ETag']:
+			cache[item['Key']]['_StorageClass'] = item['StorageClass']
+		else:
+			obj = s3.Object(CONFIG.bucket, item['Key'])
+			cacheitem = dict(obj.metadata)
+			cacheitem['_LastModified'] = item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')
+			cacheitem['_ETag']         = item['ETag']
+			cacheitem['_StorageClass'] = item['StorageClass']
+			cacheitem['_Key']          = item['Key']
+			cacheitem['_ContentType']  = obj.content_type
+			cache[item['Key']] = cacheitem
+	for k in set(cache.keys()) - all_items:
+		del cache[k]
+
+	cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
+	def transform(item):
+		def parse_date(d):
+			if not d:
+				return None
+			return datetime.datetime.strptime(d,'%Y-%m-%d').date()
+		item = dict(map(lambda x: (x[0], parse_date(x[1]) if x[0].endswith('-date') else x[1]), item.items()))
+		item = dict(map(lambda x: (x[0], set(filter(lambda x: bool(x), x[1].split(','))) if x[0] == 'tags' else x[1]), item.items()))
+		return item
+	return dict(map(lambda x: (x['uuid'], transform(x)), cache.values()))
+
+def cmd_open(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+	item = cache[args.uuid]
+	url = s3client.generate_presigned_url('get_object', Params={
+		'Bucket': CONFIG.bucket,
+		'Key': item['_Key'],
+		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
+		}, ExpiresIn=300)
+	subprocess.call(['xdg-open', url])
+
+def cmd_save(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+	item = cache[args.uuid]
+	if args.output.endswith('/'):
+		args.output += '{uuid} {original-filename}'
+	filename = args.output.format(**item)
+	s3.Bucket(CONFIG.bucket).Object(item['_Key']).download_file(filename)
+	print(filename)
+
+def cmd_geturl(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+	item = cache[args.uuid]
+	url = s3client.generate_presigned_url('get_object', Params={
+		'Bucket': CONFIG.bucket,
+		'Key': item['_Key'],
+		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
+		}, ExpiresIn=int(args.expires))
+	if CONFIG.get('pastebucket', None) is None:
+		print(url)
+	else:
+		md5part = binascii.a2b_hex(item['_ETag'].replace('"','')[:16])
+		tag = binascii.b2a_base64(md5part).decode('ascii').replace('\n','').replace('+','-').replace('/','_').replace('=','')
+		tag += '.{0}'.format(int(time.time())+args.expires)
+		if args.long:
+			tag += '/' + item['original-filename']
+		else:
+			tag += os.path.splitext(item['original-filename'])[1]
+		s3.Bucket(CONFIG.pastebucket).Object(tag).put(Body=b'', ContentType='text/plain', WebsiteRedirectLocation=url)
+		print('https://{pastebucket}/{tag}'.format(pastebucket=CONFIG.pastebucket, tag=tag))
+
+def cmd_info(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+	maxklen = max(map(lambda x: len(x), cache[args.uuid].keys()), default=1)
+	fmt = '{k:%MKL%s}  {v}'.replace('%MKL%', str(maxklen+1))
+	section = 1
+	for k, v in sorted(cache[args.uuid].items()):
+		if not k.startswith('_'):
+			if section == 1:
+				section = 2
+				print()
+		if isinstance(v, set):
+			v = ', '.join(sorted(v))
+		if isinstance(v, datetime.date):
+			v = v.strftime('%Y-%m-%d')
+		if isinstance(v, datetime.datetime):
+			v = v.strftime('%Y-%m-%d %H:%M:%S %z')
+		print(fmt.format(k=k+':', v=v))
+
+def cmd_list(args):
+	cache = load_and_update_cache()
+	def item_get_reldate(item):
+		itmrdate = item.get('relevant-date', item['archive-date'])
+		if itmrdate is None:
+			itmrdate = item['archive-date']
+		return itmrdate
+	def cachefilter(item):
+		if args.category is not None:
+			argcat = args.category.split('/')
+			itmcat = item['category'].split('/')
+			while argcat and itmcat:
+				if argcat.pop(0) != itmcat.pop(0):
+					return False
+		if args.relevant_date is not None:
+			itmrdate = item_get_reldate(item)
+			if not (args.relevant_date[0] <= itmrdate and itmrdate <= args.relevant_date[1]):
+				return False
+		if args.archive_date is not None:
+			if not (args.archive_date[0] <= item['archive-date'] and item['archive-date'] <= args.archive_date[1]):
+				return False
+		if args.tag:
+			if not item['tags'].issuperset(set(args.tag)):
+				return False
+		if args.title is not None:
+			if re.search(args.title, item['title']) is None:
+				return False
+		return True
+	def resultsortkey(item):
+		return (item_get_reldate(item), item['archive-date'], item['title'])
+	results = sorted(filter(cachefilter, cache.values()), key=resultsortkey)
+	result_cat_max_len = max(map(lambda x: len(x['category']), results), default=0)
+	for result in results:
+		fmtstr = '{item[uuid]} | {reldate} | {archdate} | {item[category]:CAT_MAX_LENs} | {fmt:4s} | {item[title]}'
+		fmtstr = fmtstr.replace('CAT_MAX_LEN', str(result_cat_max_len))
+		print(fmtstr.format(
+			item=result,
+			fmt=os.path.splitext(result['original-filename'])[1].lstrip('.').lower(),
+			reldate=result['relevant-date'].strftime('%Y-%m-%d') if result.get('relevant-date',None) is not None else '          ',
+			archdate=result['archive-date'].strftime('%Y-%m-%d')
+			))
+
+def cmd_categories(args):
+	cache = load_and_update_cache()
+	for category in sorted(set(map(lambda x: x['category'], cache.values()))):
+		print(category)
+
+def detect_mimetype(fn):
+	#try:
+	#	import magic
+	#	return magic.from_file(fn, mime=True)
+	#except ImportError:
+	#	print('Please install python3-magic!')
+	try:
+		import mimetypes
+		return mimetypes.guess_type(fn)[0] or 'application/octet-stream'
+	except ImportError:
+		pass
+	return 'application/octet-stream'
+
+def cmd_store(args):
+	if not os.path.exists(args.filename):
+		print('File not found.')
+		sys.exit(1)
+
+	cache = load_and_update_cache()
+
+	if args.new_category is None:
+		if args.category not in set(map(lambda x: x['category'], cache.values())):
+			print('Category does not yet exist.  Misspelled?  Consider --new-category/-C')
+			sys.exit(1)
+	else:
+		args.category = args.new_category
+
+	meta = {
+			'original-filename': os.path.basename(args.filename),
+			'title': args.title or os.path.splitext(os.path.basename(args.filename))[0],
+			'category': args.category or '',
+			'relevant-date': '' if args.relevant_date is None else args.relevant_date.strftime('%Y-%m-%d'),
+			'archive-date': args.archive_date.strftime('%Y-%m-%d'),
+			'tags': ','.join(sorted(args.tag)),
+			'uuid': str(uuid.uuid4()),
+			'sha256': hashlib.sha256(open(args.filename,'rb').read()).hexdigest(),
+			}
+	content_type = args.content_type or detect_mimetype(args.filename)
+	objname = '{relevant_year}/{category}/{relevant_date}/{title}/{sha256}{ext}'.format(
+			relevant_year=args.archive_date.strftime('%Y') if args.relevant_date is None else args.relevant_date.strftime('%Y'),
+			category=meta['category'],
+			relevant_date=(meta['relevant-date'] or meta['archive-date']),
+			uuid=meta['uuid'],
+			sha256=meta['sha256'],
+			title=meta['title'].replace('/','_'),
+			ext='.'+args.extension if args.extension is not None else os.path.splitext(args.filename)[1],
+			)
+
+	pprint.pprint({'file':objname,'meta':meta,'content-type':content_type})
+	if not args.dryrun:
+		s3.Bucket(CONFIG.bucket).Object(objname).upload_file(
+				args.filename,
+				ExtraArgs = {
+					'Metadata': meta, #dict(map(lambda x: ('x-amz-meta-'+x[0],x[1]), meta)),
+					'ContentType': content_type,
+					'ServerSideEncryption': 'AES256',
+					}
+				)
+
+def cmd_tweak(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+
+	if args.new_category is None:
+		if args.category is not None:
+			if args.category not in set(map(lambda x: x['category'], cache.values())):
+				print('Category does not yet exist.  Misspelled?  Consider --new-category/-C')
+				sys.exit(1)
+	else:
+		args.category = args.new_category
+
+	item = cache[args.uuid]
+	item_orig_key = item['_Key']
+
+	if args.title is not None:
+		item['title'] = args.title
+	if args.category is not None:
+		item['category'] = args.category
+	if args.relevant_date is not None:
+		item['relevant-date'] = args.relevant_date
+	if args.archive_date is not None:
+		item['archive-date'] = args.archive_date
+	if args.tag:
+		item['tags'] = args.tag
+	if args.content_type is not None:
+		item['_ContentType'] = args.content_type
+
+	objname = '{relevant_year}/{category}/{relevant_date}/{title}/{sha256}{ext}'.format(
+			relevant_year=item['archive-date'].strftime('%Y') if item['relevant-date'] is None else item['relevant-date'].strftime('%Y'),
+			category=item['category'],
+			relevant_date=(item['relevant-date'] or item['archive-date']).strftime('%Y-%m-%d'),
+			uuid=item['uuid'],
+			sha256=item['sha256'],
+			title=item['title'].replace('/','_'),
+			ext=os.path.splitext(item['_Key'])[1],
+			)
+
+	meta = dict(map(lambda x: (x[0], x[1].strftime('%Y-%m-%d') if isinstance(x[1], (datetime.date, datetime.datetime)) else x[1]), item.items()))
+	meta['tags'] = ','.join(sorted(meta['tags']))
+	meta = dict(filter(lambda x: not x[0].startswith('_'), meta.items()))
+
+	pprint.pprint({'file':objname,'meta':meta,'content-type':item['_ContentType']})
+	if not args.dryrun:
+		oldobj = s3.Bucket(CONFIG.bucket).Object(item_orig_key)
+		newobj = s3.Bucket(CONFIG.bucket).Object(objname)
+		newobj.copy_from(
+				CopySource           = {'Bucket': oldobj.bucket_name, 'Key': oldobj.key},
+				Metadata             = meta,
+				MetadataDirective    = 'REPLACE',
+				TaggingDirective     = 'COPY',
+				ContentType          = item['_ContentType'],
+				#StorageClass        = item['_StorageClass'],
+				ServerSideEncryption = 'AES256'
+				)
+		if (oldobj.bucket_name, oldobj.key) != (newobj.bucket_name, newobj.key):
+			oldobj.delete()
+
+def parse_args():
+	parser = argparse.ArgumentParser()
+	subparsers = parser.add_subparsers(dest='command')
+	subparsers.required = True
+
+	def parse_date(date):
+		if date.lower() == 'today':
+			return datetime.date.today()
+		if re.match('^[0-9]{4}-[0-9]{2}-(Z|END)$', date, re.IGNORECASE) is not None:
+			date = dateutil.parser.parse('-'.join(date.split('-')[:2]) + '-01')
+			return date.replace(day=calendar.monthrange(date.year, date.month)[1])
+		return dateutil.parser.parse(date).date()
+
+	def parse_date_range(date):
+		date = date.split('~')
+		if len(date) == 1:
+			date = parse_date(date[0])
+			return (date, date)
+		elif len(date) == 2:
+			return (parse_date(date[0]), parse_date(date[1]))
+		else:
+			raise ValueError('Date range invalid')
+
+	def parse_tag(tag):
+		if ',' in tag:
+			raise ValueError('Tags cannot contain \',\'')
+		return tag
+
+	sp = subparsers.add_parser('store')
+	sp.add_argument('-C','--new-category', action='store', default=None)
+	sp.add_argument('-c','--category', action='store', default='Misc')
+	sp.add_argument('-d','--relevant-date', action='store', type=parse_date, default=None)
+	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
+	sp.add_argument('-n','--title', action='store', default=None)
+	sp.add_argument('--dryrun', action='store_true')
+	sp.add_argument('--extension', action='store', default=None)
+	sp.add_argument('--content-type', action='store', default=None)
+	sp.add_argument('--archive-date', action='store', type=parse_date, default=datetime.date.today())
+	sp.add_argument('filename')
+	sp.set_defaults(command_function=cmd_store)
+
+	sp = subparsers.add_parser('tweak')
+	sp.add_argument('-C','--new-category', action='store', default=None)
+	sp.add_argument('-c','--category', action='store', default=None)
+	sp.add_argument('-d','--relevant-date', action='store', type=parse_date, default=None)
+	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
+	sp.add_argument('-n','--title', action='store', default=None)
+	sp.add_argument('--dryrun', action='store_true')
+	sp.add_argument('--content-type', action='store', default=None)
+	sp.add_argument('--archive-date', action='store', type=parse_date, default=None)
+	sp.add_argument('uuid')
+	sp.set_defaults(command_function=cmd_tweak)
+
+	sp = subparsers.add_parser('list')
+	sp.add_argument('-c','--category', action='store', default=None)
+	sp.add_argument('-d','--relevant-date', action='store', type=parse_date_range, default=None)
+	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
+	sp.add_argument('-n','--title', action='store', default=None)
+	sp.add_argument('--extension', action='store', default=None)
+	sp.add_argument('--archive-date', action='store', type=parse_date_range, default=None)
+	sp.set_defaults(command_function=cmd_list)
+
+	sp = subparsers.add_parser('categories')
+	#sp.add_argument('-c','--category', action='store', default=None)
+	sp.set_defaults(command_function=cmd_categories)
+
+	sp = subparsers.add_parser('geturl')
+	sp.add_argument('-e','--expires', action='store', type=int, default=3600)
+	if CONFIG.get('pastebucket', None) is not None:
+		sp.add_argument('-l','--long', action='store_true')
+	sp.add_argument('uuid')
+	sp.set_defaults(command_function=cmd_geturl)
+
+	sp = subparsers.add_parser('open')
+	sp.add_argument('uuid')
+	sp.set_defaults(command_function=cmd_open)
+
+	sp = subparsers.add_parser('save')
+	sp.add_argument('uuid')
+	sp.add_argument('-o','--output', action='store', default='{uuid} {original-filename}')
+	sp.set_defaults(command_function=cmd_save)
+
+	sp = subparsers.add_parser('info')
+	sp.add_argument('uuid')
+	sp.set_defaults(command_function=cmd_info)
+	return parser.parse_args()
+
+args = parse_args()
+args.command_function(args)
