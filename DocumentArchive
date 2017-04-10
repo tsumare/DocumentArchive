@@ -35,7 +35,7 @@ s3client = s3session.client('s3')
 s3 = s3session.resource('s3')
 
 def load_and_update_cache():
-	cache_object = s3.Bucket(CONFIG.bucket).Object('cache.json')
+	cache_object = s3.Bucket(CONFIG['bucket']).Object('cache.json')
 	try:
 		cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
 	except s3client.exceptions.NoSuchKey:
@@ -43,14 +43,14 @@ def load_and_update_cache():
 		cache = {}
 
 	all_items = set()
-	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG.bucket))):
+	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
 		if '/' not in item['Key']:
 			continue # ignore cache.json, etc
 		all_items.add(item['Key'])
 		if item['Key'] in cache and cache[item['Key']]['_LastModified'] == item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ') and cache[item['Key']]['_ETag'] == item['ETag']:
 			cache[item['Key']]['_StorageClass'] = item['StorageClass']
 		else:
-			obj = s3.Object(CONFIG.bucket, item['Key'])
+			obj = s3.Object(CONFIG['bucket'], item['Key'])
 			cacheitem = dict(obj.metadata)
 			cacheitem['_LastModified'] = item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')
 			cacheitem['_ETag']         = item['ETag']
@@ -79,7 +79,7 @@ def cmd_open(args):
 		return
 	item = cache[args.uuid]
 	url = s3client.generate_presigned_url('get_object', Params={
-		'Bucket': CONFIG.bucket,
+		'Bucket': CONFIG['bucket'],
 		'Key': item['_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
 		}, ExpiresIn=300)
@@ -94,8 +94,17 @@ def cmd_save(args):
 	if args.output.endswith('/'):
 		args.output += '{uuid} {original-filename}'
 	filename = args.output.format(**item)
-	s3.Bucket(CONFIG.bucket).Object(item['_Key']).download_file(filename)
+	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).download_file(filename)
 	print(filename)
+
+def cmd_delete(args):
+	cache = load_and_update_cache()
+	if not args.uuid in cache:
+		print('UUID not known')
+		return
+	item = cache[args.uuid]
+	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).delete()
+	print(args.uuid)
 
 def cmd_geturl(args):
 	cache = load_and_update_cache()
@@ -104,7 +113,7 @@ def cmd_geturl(args):
 		return
 	item = cache[args.uuid]
 	url = s3client.generate_presigned_url('get_object', Params={
-		'Bucket': CONFIG.bucket,
+		'Bucket': CONFIG['bucket'],
 		'Key': item['_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
 		}, ExpiresIn=int(args.expires))
@@ -118,8 +127,8 @@ def cmd_geturl(args):
 			tag += '/' + item['original-filename']
 		else:
 			tag += os.path.splitext(item['original-filename'])[1]
-		s3.Bucket(CONFIG.pastebucket).Object(tag).put(Body=b'', ContentType='text/plain', WebsiteRedirectLocation=url)
-		print('https://{pastebucket}/{tag}'.format(pastebucket=CONFIG.pastebucket, tag=tag))
+		s3.Bucket(CONFIG['pastebucket']).Object(tag).put(Body=b'', ContentType='text/plain', WebsiteRedirectLocation=url)
+		print('https://{pastebucket}/{tag}'.format(pastebucket=CONFIG['pastebucket'], tag=tag))
 
 def cmd_info(args):
 	cache = load_and_update_cache()
@@ -239,7 +248,7 @@ def cmd_store(args):
 
 	pprint.pprint({'file':objname,'meta':meta,'content-type':content_type})
 	if not args.dryrun:
-		s3.Bucket(CONFIG.bucket).Object(objname).upload_file(
+		s3.Bucket(CONFIG['bucket']).Object(objname).upload_file(
 				args.filename,
 				ExtraArgs = {
 					'Metadata': meta, #dict(map(lambda x: ('x-amz-meta-'+x[0],x[1]), meta)),
@@ -294,8 +303,8 @@ def cmd_tweak(args):
 
 	pprint.pprint({'file':objname,'meta':meta,'content-type':item['_ContentType']})
 	if not args.dryrun:
-		oldobj = s3.Bucket(CONFIG.bucket).Object(item_orig_key)
-		newobj = s3.Bucket(CONFIG.bucket).Object(objname)
+		oldobj = s3.Bucket(CONFIG['bucket']).Object(item_orig_key)
+		newobj = s3.Bucket(CONFIG['bucket']).Object(objname)
 		newobj.copy_from(
 				CopySource           = {'Bucket': oldobj.bucket_name, 'Key': oldobj.key},
 				Metadata             = meta,
@@ -389,6 +398,10 @@ def parse_args():
 	sp.add_argument('uuid')
 	sp.add_argument('-o','--output', action='store', default='{uuid} {original-filename}')
 	sp.set_defaults(command_function=cmd_save)
+
+	sp = subparsers.add_parser('dElEtE')
+	sp.add_argument('uuid')
+	sp.set_defaults(command_function=cmd_delete)
 
 	sp = subparsers.add_parser('info')
 	sp.add_argument('uuid')
