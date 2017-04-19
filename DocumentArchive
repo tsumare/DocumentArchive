@@ -34,34 +34,40 @@ s3session = boto3.Session()
 s3client = s3session.client('s3')
 s3 = s3session.resource('s3')
 
-def load_and_update_cache():
+def load_and_update_cache(update=True, append=set(), exclude=set()):
 	cache_object = s3.Bucket(CONFIG['bucket']).Object('cache.json')
 	try:
 		cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
 	except s3client.exceptions.NoSuchKey:
 		print('Cache not found, creating.')
 		cache = {}
+		update = True
 
-	all_items = set()
-	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
-		if '/' not in item['Key']:
-			continue # ignore cache.json, etc
-		all_items.add(item['Key'])
-		if item['Key'] in cache and cache[item['Key']]['_LastModified'] == item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ') and cache[item['Key']]['_ETag'] == item['ETag']:
-			cache[item['Key']]['_StorageClass'] = item['StorageClass']
-		else:
-			obj = s3.Object(CONFIG['bucket'], item['Key'])
-			cacheitem = dict(obj.metadata)
-			cacheitem['_LastModified'] = item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')
-			cacheitem['_ETag']         = item['ETag']
-			cacheitem['_StorageClass'] = item['StorageClass']
-			cacheitem['_Key']          = item['Key']
-			cacheitem['_ContentType']  = obj.content_type
-			cache[item['Key']] = cacheitem
-	for k in set(cache.keys()) - all_items:
-		del cache[k]
+	if update:
+		all_items = set()
+		for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
+			if item['Key'] in exclude:
+				continue
+			if '/' not in item['Key']:
+				continue # ignore cache.json, etc
+			all_items.add(item['Key'])
+			if item['Key'] in cache and cache[item['Key']]['_LastModified'] == item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ') and cache[item['Key']]['_ETag'] == item['ETag']:
+				cache[item['Key']]['_StorageClass'] = item['StorageClass']
+			else:
+				obj = s3.Object(CONFIG['bucket'], item['Key'])
+				cacheitem = dict(obj.metadata)
+				cacheitem['_LastModified'] = item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')
+				cacheitem['_ETag']         = item['ETag']
+				cacheitem['_StorageClass'] = item['StorageClass']
+				cacheitem['_Key']          = item['Key']
+				cacheitem['_ContentType']  = obj.content_type
+				cache[item['Key']] = cacheitem
+		for k in set(cache.keys()) - all_items:
+			del cache[k]
+		cache.update(append)
 
-	cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
+		cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
+
 	def transform(item):
 		def parse_date(d):
 			if not d:
@@ -98,12 +104,13 @@ def cmd_save(args):
 	print(filename)
 
 def cmd_delete(args):
-	cache = load_and_update_cache()
+	cache = load_and_update_cache(update=True)
 	if not args.uuid in cache:
 		print('UUID not known')
 		return
 	item = cache[args.uuid]
 	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).delete()
+	load_and_update_cache(update=True, exclude=item['_Key'])
 	print(args.uuid)
 
 def cmd_geturl(args):
@@ -248,7 +255,8 @@ def cmd_store(args):
 
 	pprint.pprint({'file':objname,'meta':meta,'content-type':content_type})
 	if not args.dryrun:
-		s3.Bucket(CONFIG['bucket']).Object(objname).upload_file(
+		obj = s3.Bucket(CONFIG['bucket']).Object(objname)
+		obj.upload_file(
 				args.filename,
 				ExtraArgs = {
 					'Metadata': meta, #dict(map(lambda x: ('x-amz-meta-'+x[0],x[1]), meta)),
@@ -256,9 +264,16 @@ def cmd_store(args):
 					'ServerSideEncryption': 'AES256',
 					}
 				)
+		cacheitem = dict(meta)
+		cacheitem['_LastModified'] = obj.last_modified.strftime('%Y-%m-%dT%H:%M:%SZ')
+		cacheitem['_ETag']         = obj.e_tag
+		cacheitem['_StorageClass'] = obj.storage_class
+		cacheitem['_Key']          = obj.key
+		cacheitem['_ContentType']  = obj.content_type
+		load_and_update_cache(update=True, append={ objname: cacheitem })
 
 def cmd_tweak(args):
-	cache = load_and_update_cache()
+	cache = load_and_update_cache(update=True)
 	if not args.uuid in cache:
 		print('UUID not known')
 		return
@@ -316,6 +331,13 @@ def cmd_tweak(args):
 				)
 		if (oldobj.bucket_name, oldobj.key) != (newobj.bucket_name, newobj.key):
 			oldobj.delete()
+		cacheitem = dict(meta)
+		cacheitem['_LastModified'] = newobj.last_modified.strftime('%Y-%m-%dT%H:%M:%SZ')
+		cacheitem['_ETag']         = newobj.e_tag
+		cacheitem['_StorageClass'] = newobj.storage_class
+		cacheitem['_Key']          = newobj.key
+		cacheitem['_ContentType']  = newobj.content_type
+		load_and_update_cache(update=True, append={ newobj.key: cacheitem }, exclude=oldobj.key)
 
 def parse_args():
 	parser = argparse.ArgumentParser()
