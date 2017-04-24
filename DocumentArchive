@@ -243,7 +243,7 @@ def cmd_store(args):
 			'sha256': hashlib.sha256(open(args.filename,'rb').read()).hexdigest(),
 			}
 	content_type = args.content_type or detect_mimetype(args.filename)
-	objname = '{relevant_year}/{category}/{relevant_date}/{title}/{sha256}{ext}'.format(
+	objname = '{relevant_year}/{category}/{relevant_date} - {title}/{sha256}{ext}'.format(
 			relevant_year=args.archive_date.strftime('%Y') if args.relevant_date is None else args.relevant_date.strftime('%Y'),
 			category=meta['category'],
 			relevant_date=(meta['relevant-date'] or meta['archive-date']),
@@ -302,7 +302,7 @@ def cmd_tweak(args):
 	if args.content_type is not None:
 		item['_ContentType'] = args.content_type
 
-	objname = '{relevant_year}/{category}/{relevant_date}/{title}/{sha256}{ext}'.format(
+	objname = '{relevant_year}/{category}/{relevant_date} - {title}/{sha256}{ext}'.format(
 			relevant_year=item['archive-date'].strftime('%Y') if item['relevant-date'] is None else item['relevant-date'].strftime('%Y'),
 			category=item['category'],
 			relevant_date=(item['relevant-date'] or item['archive-date']).strftime('%Y-%m-%d'),
