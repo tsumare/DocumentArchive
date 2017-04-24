@@ -9,6 +9,7 @@ import dateutil.parser
 import hashlib
 import itertools
 import json
+import marshal
 import os
 import pprint
 import re
@@ -36,12 +37,19 @@ s3 = s3session.resource('s3')
 
 def load_and_update_cache(update=True, append=set(), exclude=set()):
 	cache_object = s3.Bucket(CONFIG['bucket']).Object('cache.json')
-	try:
-		cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
-	except s3client.exceptions.NoSuchKey:
-		print('Cache not found, creating.')
-		cache = {}
-		update = True
+	cache = None
+	if os.environ.get('DOCUMENTARCHIVE_LOCAL_CACHE',None) is not None:
+		try:
+			cache = marshal.load(open(os.environ['DOCUMENTARCHIVE_LOCAL_CACHE'], 'rb'))
+		except FileNotFoundError:
+			update = True
+	if cache is None:
+		try:
+			cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
+		except s3client.exceptions.NoSuchKey:
+			print('Cache not found, creating.')
+			cache = {}
+			update = True
 
 	if update:
 		all_items = set()
@@ -66,7 +74,10 @@ def load_and_update_cache(update=True, append=set(), exclude=set()):
 			del cache[k]
 		cache.update(append)
 
-		cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
+		if os.environ.get('DOCUMENTARCHIVE_LOCAL_CACHE',None) is not None:
+			marshal.dump(cache, open(os.environ['DOCUMENTARCHIVE_LOCAL_CACHE'], 'wb'))
+		else:
+			cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
 
 	def transform(item):
 		def parse_date(d):
@@ -315,6 +326,8 @@ def cmd_tweak(args):
 	meta = dict(map(lambda x: (x[0], x[1].strftime('%Y-%m-%d') if isinstance(x[1], (datetime.date, datetime.datetime)) else x[1]), item.items()))
 	meta['tags'] = ','.join(sorted(meta['tags']))
 	meta = dict(filter(lambda x: not x[0].startswith('_'), meta.items()))
+	if meta['relevant-date'] is None:
+		meta['relevant-date'] = ''
 
 	pprint.pprint({'file':objname,'meta':meta,'content-type':item['_ContentType']})
 	if not args.dryrun:
