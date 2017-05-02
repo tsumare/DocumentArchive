@@ -375,6 +375,17 @@ def parse_args():
 		else:
 			raise ValueError('Date range invalid')
 
+	def parse_duration(duration):
+		assert re.match('^([0-9]+|([0-9]+y)?([0-9]+M)?([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?)$', duration) is not None, 'Invalid duration '+duration
+		parts = re.findall('[0-9]+[yMwdhms]', duration)
+		if not parts:
+			return int(duration)
+		else:
+			duration = 0
+			for part in parts:
+				duration += int(part[:-1]) * {'y':86400*365, 'M':86400*31, 'd':86400, 'h':3600, 'm': 60, 's':1}[part[-1]]
+			return duration
+
 	def parse_tag(tag):
 		if ',' in tag:
 			raise ValueError('Tags cannot contain \',\'')
@@ -419,7 +430,7 @@ def parse_args():
 	sp.set_defaults(command_function=cmd_categories)
 
 	sp = subparsers.add_parser('geturl')
-	sp.add_argument('-e','--expires', action='store', type=int, default=3600)
+	sp.add_argument('-e','--expires', action='store', type=parse_duration, default=3600)
 	if CONFIG.get('pastebucket', None) is not None:
 		sp.add_argument('-l','--long', action='store_true')
 	sp.add_argument('uuid')
