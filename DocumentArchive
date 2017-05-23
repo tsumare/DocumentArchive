@@ -110,7 +110,8 @@ def cmd_save(args):
 	item = cache[args.uuid]
 	if args.output.endswith('/'):
 		args.output += '{uuid} {original-filename}'
-	filename = args.output.format(**item)
+	filename = args.output.format(extension=os.path.splitext(item['original-filename'])[1], **item)
+	os.makedirs(os.path.abspath(os.path.dirname(filename)), exist_ok=True)
 	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).download_file(filename)
 	print(filename)
 
