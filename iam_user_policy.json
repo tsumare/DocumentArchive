@@ -1,0 +1,29 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "AllowS3Access",
+			"Effect": "Allow",
+			"Action": [
+				"s3:GetObject",
+				"s3:ListBucket",
+				"s3:PutObject",
+				"s3:DeleteObject"
+			],
+			"Resource": [
+				"arn:aws:s3:::your.bucket.com",
+				"arn:aws:s3:::your.bucket.com/*"
+			]
+		},
+		{
+			"Sid": "AllowSimpleDBAccess",
+			"Action": [
+				"sdb:*"
+			],
+			"Effect": "Allow",
+			"Resource": [
+				"arn:aws:sdb:*:123456789012:domain/documentarchive"
+			]
+		}
+	]
+}

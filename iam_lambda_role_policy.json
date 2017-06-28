@@ -1,0 +1,35 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Effect": "Allow",
+			"Action": [
+				"logs:CreateLogGroup",
+				"logs:CreateLogStream",
+				"logs:PutLogEvents"
+			],
+			"Resource": "arn:aws:logs:*:*:*"
+		},
+		{
+			"Sid": "AllowBucketAccess",
+			"Action": [
+				"s3:GetObject",
+				"s3:DeleteObject"
+			],
+			"Effect": "Allow",
+			"Resource": [
+				"arn:aws:s3:::your.bucket.com/*"
+			]
+		},
+		{
+			"Sid": "AllowSimpleDBAccess",
+			"Action": [
+				"sdb:*"
+			],
+			"Effect": "Allow",
+			"Resource": [
+				"arn:aws:sdb:*:123456789012:domain/documentarchive"
+			]
+		}
+	]
+}

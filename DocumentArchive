@@ -34,113 +34,111 @@ except Exception as e:
 s3session = boto3.Session()
 s3client = s3session.client('s3')
 s3 = s3session.resource('s3')
+sdb = s3session.client('sdb')
 
-def load_and_update_cache(update=True, append=set(), exclude=set()):
-	cache_object = s3.Bucket(CONFIG['bucket']).Object('cache.json')
-	cache = None
-	if os.environ.get('DOCUMENTARCHIVE_LOCAL_CACHE',None) is not None:
-		try:
-			cache = marshal.load(open(os.environ['DOCUMENTARCHIVE_LOCAL_CACHE'], 'rb'))
-		except FileNotFoundError:
-			update = True
-	if cache is None:
-		try:
-			cache = json.loads(cache_object.get()['Body'].read().decode('utf8'))
-		except s3client.exceptions.NoSuchKey:
-			print('Cache not found, creating.')
-			cache = {}
-			update = True
-
-	if update:
-		all_items = set()
-		for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
-			if item['Key'] in exclude:
-				continue
-			if '/' not in item['Key']:
-				continue # ignore cache.json, etc
-			all_items.add(item['Key'])
-			if item['Key'] in cache and cache[item['Key']]['_LastModified'] == item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ') and cache[item['Key']]['_ETag'] == item['ETag']:
-				cache[item['Key']]['_StorageClass'] = item['StorageClass']
+def cmd_rebuild(args):
+	sdb.delete_domain(DomainName=CONFIG['simpledb_domain'])
+	sdb.create_domain(DomainName=CONFIG['simpledb_domain'])
+	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
+		obj = s3.Object(CONFIG['bucket'], item['Key'])
+		sdb_attrs = dict(obj.metadata)
+		if 'uuid' not in sdb_attrs:
+			continue
+		print('{}  {}'.format(sdb_attrs['uuid'], item['Key']))
+		sdb_attrs['S3_ContentType'] = obj.content_type
+		sdb_attrs['S3_Key'] = item['Key']
+		sdb_attrs['S3_Sequencer'] = '0 {}'.format(item['Key'])
+		Attributes = []
+		for k,v in sdb_attrs.items():
+			if k == 'tags':
+				for tag in map(lambda x: x.strip(), sdb_attrs['tags'].split(',')):
+					Attributes.append({'Name': 'tags', 'Value': tag, 'Replace':True})
 			else:
-				obj = s3.Object(CONFIG['bucket'], item['Key'])
-				cacheitem = dict(obj.metadata)
-				cacheitem['_LastModified'] = item['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')
-				cacheitem['_ETag']         = item['ETag']
-				cacheitem['_StorageClass'] = item['StorageClass']
-				cacheitem['_Key']          = item['Key']
-				cacheitem['_ContentType']  = obj.content_type
-				cache[item['Key']] = cacheitem
-		for k in set(cache.keys()) - all_items:
-			del cache[k]
-		cache.update(append)
+				Attributes.append({'Name': k, 'Value': v, 'Replace':True})
+		sdb.put_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=sdb_attrs['uuid'], Attributes=Attributes)
+		sdb.delete_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=sdb_attrs['uuid'], Attributes=[{'Name': 'tags', 'Value': ''}])
+	s3.Bucket(CONFIG['bucket']).Object('cache.json').delete()
 
-		if os.environ.get('DOCUMENTARCHIVE_LOCAL_CACHE',None) is not None:
-			marshal.dump(cache, open(os.environ['DOCUMENTARCHIVE_LOCAL_CACHE'], 'wb'))
+def parse_attributes(Attributes):
+	if isinstance(Attributes, dict):
+		Attributes = Attributes.get('Attributes',[])
+	def parse_date(d):
+		if not d:
+			return None
+		return datetime.datetime.strptime(d,'%Y-%m-%d').date()
+	item = {}
+	for k,v in map(lambda x: (x['Name'], x['Value']), Attributes):
+		if k.endswith('-date'):
+			v = None if not v else datetime.datetime.strptime(v, '%Y-%m-%d').date()
+		if k not in item:
+			item[k] = v
 		else:
-			cache_object.put(Body=json.dumps(cache).encode('utf8'), ContentType='text/json', ServerSideEncryption='AES256')
+			if not isinstance(item[k], list):
+				item[k] = [item[k]]
+			item[k].append(v)
+	if item:
+		item.setdefault('tags',[])
+	return item
 
-	def transform(item):
-		def parse_date(d):
-			if not d:
-				return None
-			return datetime.datetime.strptime(d,'%Y-%m-%d').date()
-		item = dict(map(lambda x: (x[0], parse_date(x[1]) if x[0].endswith('-date') else x[1]), item.items()))
-		item = dict(map(lambda x: (x[0], set(filter(lambda x: bool(x), x[1].split(','))) if x[0] == 'tags' else x[1]), item.items()))
-		return item
-	return dict(map(lambda x: (x['uuid'], transform(x)), cache.values()))
+def sdb_select(SelectExpression, count_query=False):
+	if count_query:
+		return sum(map(lambda x: parse_attributes(x)['count'], sdb_select(SelectExpression, count_query=False)))
+	kwargs = { 'SelectExpression': SelectExpression }
+	while True:
+		ret = sdb.select(**kwargs)
+		yield from ret.get('Items',[])
+		if 'NextToken' in ret:
+			kwargs['NextToken'] = ret['NextToken']
+		else:
+			break
 
 def cmd_open(args):
-	cache = load_and_update_cache()
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
-	item = cache[args.uuid]
 	url = s3client.generate_presigned_url('get_object', Params={
 		'Bucket': CONFIG['bucket'],
-		'Key': item['_Key'],
+		'Key': item['S3_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
 		}, ExpiresIn=300)
 	subprocess.call(['xdg-open', url])
 
 def cmd_save(args):
-	cache = load_and_update_cache()
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
-	item = cache[args.uuid]
 	if args.output.endswith('/'):
 		args.output += '{uuid} {original-filename}'
 	filename = args.output.format(extension=os.path.splitext(item['original-filename'])[1], **item)
 	os.makedirs(os.path.abspath(os.path.dirname(filename)), exist_ok=True)
-	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).download_file(filename)
+	s3.Bucket(CONFIG['bucket']).Object(item['S3_Key']).download_file(filename)
 	print(filename)
 
 def cmd_delete(args):
-	cache = load_and_update_cache(update=True)
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
-	item = cache[args.uuid]
-	s3.Bucket(CONFIG['bucket']).Object(item['_Key']).delete()
-	load_and_update_cache(update=True, exclude=item['_Key'])
+	s3.Bucket(CONFIG['bucket']).Object(item['S3_Key']).delete()
 	print(args.uuid)
 
 def cmd_geturl(args):
-	cache = load_and_update_cache()
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
-	item = cache[args.uuid]
 	url = s3client.generate_presigned_url('get_object', Params={
 		'Bucket': CONFIG['bucket'],
-		'Key': item['_Key'],
+		'Key': item['S3_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
 		}, ExpiresIn=int(args.expires))
 	if CONFIG.get('pastebucket', None) is None:
 		print(url)
 	else:
-		md5part = binascii.a2b_hex(item['_ETag'].replace('"','')[:16])
-		tag = binascii.b2a_base64(md5part).decode('ascii').replace('\n','').replace('+','-').replace('/','_').replace('=','')
+		shapart = binascii.a2b_hex(item['sha256'][:16])
+		tag = binascii.b2a_base64(shapart).decode('ascii').replace('\n','').replace('+','-').replace('/','_').replace('=','')
 		tag += '.{0}'.format(int(time.time())+args.expires)
 		if args.long:
 			tag += '/' + item['original-filename']
@@ -150,19 +148,19 @@ def cmd_geturl(args):
 		print('https://{pastebucket}/{tag}'.format(pastebucket=CONFIG['pastebucket'], tag=tag))
 
 def cmd_info(args):
-	cache = load_and_update_cache()
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
-	maxklen = max(map(lambda x: len(x), cache[args.uuid].keys()), default=1)
+	maxklen = max(map(lambda x: len(x), item.keys()), default=1)
 	fmt = '{k:%MKL%s}  {v}'.replace('%MKL%', str(maxklen+1))
 	section = 1
-	for k, v in sorted(cache[args.uuid].items()):
-		if not k.startswith('_'):
+	for k, v in sorted(item.items(), key=lambda x: (not x[0].startswith('S3_'), x)):
+		if not k.startswith('S3_'):
 			if section == 1:
 				section = 2
 				print()
-		if isinstance(v, set):
+		if isinstance(v, (set,list)):
 			v = ', '.join(sorted(v))
 		if isinstance(v, datetime.date):
 			v = v.strftime('%Y-%m-%d')
@@ -171,36 +169,46 @@ def cmd_info(args):
 		print(fmt.format(k=k+':', v=v))
 
 def cmd_list(args):
-	cache = load_and_update_cache()
-	def item_get_reldate(item):
+	def queryquote(v):
+		return v.replace('\\','\\\\').replace('"','\\"')
+	query = []
+	if args.category is not None:
+		query.append('(category = "{}" or category like "{}/%")'.format(queryquote(args.category), queryquote(args.category).replace('%','\\%')))
+	if args.relevant_date is not None:
+		query.append('''
+			(
+				`relevant-date` between "{start_date}" and "{end_date}"
+				or
+				(
+					`relevant-date` is null
+					and
+					`archive-date` between "{start_date}" and "{end_date}"
+				)
+			)'''.format(start_date=queryquote(args.relevant_date[0]), end_date=queryquote(args.relevant_date[1])))
+	if args.archive_date is not None:
+		query.append('`archive-date` between "{}" and "{}"'.format(queryquote(args.archive_date[0]), queryquote(args.archive_date[1])))
+	if args.tag:
+		query.append(' intersection '.join(map(lambda x: 'tags = "{}"'.format(queryquote(x)), set(args.tag))))
+	if args.title is not None:
+		if '%' in args.title:
+			query.append('title like "{}"'.format(queryquote(args.title).replace('%%','\\%')))
+		else:
+			query.append('title like "%{}%"'.format(queryquote(args.title)))
+	if query:
+		query = 'select * from {} where {}'.format(CONFIG['simpledb_domain'], ' and '.join(query))
+	else:
+		query = 'select * from {}'.format(CONFIG['simpledb_domain'])
+	try:
+		query = map(parse_attributes, sdb_select(SelectExpression=query))
+	except Exception:
+		print('Query: {}'.format(query))
+		raise
+	def resultsortkey(item):
 		itmrdate = item.get('relevant-date', item['archive-date'])
 		if itmrdate is None:
 			itmrdate = item['archive-date']
-		return itmrdate
-	def cachefilter(item):
-		if args.category is not None:
-			argcat = args.category.split('/')
-			itmcat = item['category'].split('/')
-			while argcat and itmcat:
-				if argcat.pop(0) != itmcat.pop(0):
-					return False
-		if args.relevant_date is not None:
-			itmrdate = item_get_reldate(item)
-			if not (args.relevant_date[0] <= itmrdate and itmrdate <= args.relevant_date[1]):
-				return False
-		if args.archive_date is not None:
-			if not (args.archive_date[0] <= item['archive-date'] and item['archive-date'] <= args.archive_date[1]):
-				return False
-		if args.tag:
-			if not item['tags'].issuperset(set(args.tag)):
-				return False
-		if args.title is not None:
-			if re.search(args.title, item['title']) is None:
-				return False
-		return True
-	def resultsortkey(item):
-		return (item_get_reldate(item), item['archive-date'], item['title'])
-	results = sorted(filter(cachefilter, cache.values()), key=resultsortkey)
+		return (itmrdate, item['archive-date'], item['title'])
+	results = sorted(query, key=resultsortkey)
 	result_cat_max_len = max(map(lambda x: len(x['category']), results), default=0)
 	for result in results:
 		fmtstr = '{item[uuid]} | {reldate} | {archdate} | {item[category]:CAT_MAX_LENs} | {fmt:4s} | {item[title]}'
@@ -213,8 +221,9 @@ def cmd_list(args):
 			))
 
 def cmd_categories(args):
-	cache = load_and_update_cache()
-	for category in sorted(set(map(lambda x: x['category'], cache.values()))):
+	categories = map(lambda x: parse_attributes(x)['category'], sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain'])))
+	categories = sorted(set(categories))
+	for category in categories:
 		print(category)
 
 def detect_mimetype(fn):
@@ -235,14 +244,26 @@ def cmd_store(args):
 		print('File not found.')
 		sys.exit(1)
 
-	cache = load_and_update_cache()
-
+	if args.new_category is None and args.category is None:
+		print('A category is required!')
+		sys.exit(1)
 	if args.new_category is None:
-		if args.category not in set(map(lambda x: x['category'], cache.values())):
+		if not sdb_select(SelectExpression='select count(*) from {} where category = "{}"'.format(CONFIG['simpledb_domain'], args.category), count_query=True):
 			print('Category does not yet exist.  Misspelled?  Consider --new-category/-C')
 			sys.exit(1)
 	else:
 		args.category = args.new_category
+
+	# Attempt to reserve an ID.  Because we do not set S3_Sequencer, this should
+	# not interfere with the metadata update lambda.
+	item_uuid = None
+	while item_uuid is None:
+		item_uuid = str(uuid.uuid4())
+		try:
+			sdb.put_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=item_uuid, Attributes=[{'Name':'uuid','Value':item_uuid}], Expected={'Name':'uuid','Exists':False})
+		except Exception as e:
+			print('UUID Reservation Exception (Retrying): {}'.format(e))
+			item_uuid = None
 
 	meta = {
 			'original-filename': os.path.basename(args.filename),
@@ -251,11 +272,11 @@ def cmd_store(args):
 			'relevant-date': '' if args.relevant_date is None else args.relevant_date.strftime('%Y-%m-%d'),
 			'archive-date': args.archive_date.strftime('%Y-%m-%d'),
 			'tags': ','.join(sorted(args.tag)),
-			'uuid': str(uuid.uuid4()),
+			'uuid': item_uuid,
 			'sha256': hashlib.sha256(open(args.filename,'rb').read()).hexdigest(),
 			}
 	content_type = args.content_type or detect_mimetype(args.filename)
-	objname = '{relevant_year}/{category}/{relevant_date} {title}/{sha256}{ext}'.format(
+	objname = '{relevant_year}/{category}/{relevant_date} {title}/{uuid}{ext}'.format(
 			relevant_year=args.archive_date.strftime('%Y') if args.relevant_date is None else args.relevant_date.strftime('%Y'),
 			category=meta['category'],
 			relevant_date=(meta['relevant-date'] or meta['archive-date']),
@@ -276,30 +297,21 @@ def cmd_store(args):
 					'ServerSideEncryption': 'AES256',
 					}
 				)
-		cacheitem = dict(meta)
-		cacheitem['_LastModified'] = obj.last_modified.strftime('%Y-%m-%dT%H:%M:%SZ')
-		cacheitem['_ETag']         = obj.e_tag
-		cacheitem['_StorageClass'] = obj.storage_class
-		cacheitem['_Key']          = obj.key
-		cacheitem['_ContentType']  = obj.content_type
-		load_and_update_cache(update=True, append={ objname: cacheitem })
 
 def cmd_tweak(args):
-	cache = load_and_update_cache(update=True)
-	if not args.uuid in cache:
+	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
+	if not item:
 		print('UUID not known')
 		return
 
-	if args.new_category is None:
-		if args.category is not None:
-			if args.category not in set(map(lambda x: x['category'], cache.values())):
-				print('Category does not yet exist.  Misspelled?  Consider --new-category/-C')
-				sys.exit(1)
+	if args.new_category is None and args.category is not None:
+		if not sdb_select(SelectExpression='select count(*) from {} where category = "{}"'.format(CONFIG['simpledb_domain'], args.category), count_query=True):
+			print('Category does not yet exist.  Misspelled?  Consider --new-category/-C')
+			sys.exit(1)
 	else:
 		args.category = args.new_category
 
-	item = cache[args.uuid]
-	item_orig_key = item['_Key']
+	item_orig_key = item['S3_Key']
 
 	if args.title is not None:
 		item['title'] = args.title
@@ -312,25 +324,25 @@ def cmd_tweak(args):
 	if args.tag:
 		item['tags'] = args.tag
 	if args.content_type is not None:
-		item['_ContentType'] = args.content_type
+		item['S3_ContentType'] = args.content_type
 
-	objname = '{relevant_year}/{category}/{relevant_date} {title}/{sha256}{ext}'.format(
+	objname = '{relevant_year}/{category}/{relevant_date} {title}/{uuid}{ext}'.format(
 			relevant_year=item['archive-date'].strftime('%Y') if item['relevant-date'] is None else item['relevant-date'].strftime('%Y'),
 			category=item['category'],
 			relevant_date=(item['relevant-date'] or item['archive-date']).strftime('%Y-%m-%d'),
 			uuid=item['uuid'],
 			sha256=item['sha256'],
 			title=item['title'].replace('/','_'),
-			ext=os.path.splitext(item['_Key'])[1],
+			ext=os.path.splitext(item['S3_Key'])[1],
 			)
 
 	meta = dict(map(lambda x: (x[0], x[1].strftime('%Y-%m-%d') if isinstance(x[1], (datetime.date, datetime.datetime)) else x[1]), item.items()))
 	meta['tags'] = ','.join(sorted(meta['tags']))
-	meta = dict(filter(lambda x: not x[0].startswith('_'), meta.items()))
+	meta = dict(filter(lambda x: not x[0].startswith('S3_'), meta.items()))
 	if meta['relevant-date'] is None:
 		meta['relevant-date'] = ''
 
-	pprint.pprint({'file':objname,'meta':meta,'content-type':item['_ContentType']})
+	pprint.pprint({'file':objname,'meta':meta,'content-type':item['S3_ContentType']})
 	if not args.dryrun:
 		oldobj = s3.Bucket(CONFIG['bucket']).Object(item_orig_key)
 		newobj = s3.Bucket(CONFIG['bucket']).Object(objname)
@@ -339,19 +351,12 @@ def cmd_tweak(args):
 				Metadata             = meta,
 				MetadataDirective    = 'REPLACE',
 				TaggingDirective     = 'COPY',
-				ContentType          = item['_ContentType'],
+				ContentType          = item['S3_ContentType'],
 				#StorageClass        = item['_StorageClass'],
 				ServerSideEncryption = 'AES256'
 				)
 		if (oldobj.bucket_name, oldobj.key) != (newobj.bucket_name, newobj.key):
 			oldobj.delete()
-		cacheitem = dict(meta)
-		cacheitem['_LastModified'] = newobj.last_modified.strftime('%Y-%m-%dT%H:%M:%SZ')
-		cacheitem['_ETag']         = newobj.e_tag
-		cacheitem['_StorageClass'] = newobj.storage_class
-		cacheitem['_Key']          = newobj.key
-		cacheitem['_ContentType']  = newobj.content_type
-		load_and_update_cache(update=True, append={ newobj.key: cacheitem }, exclude=oldobj.key)
 
 def parse_args():
 	parser = argparse.ArgumentParser()
@@ -453,6 +458,9 @@ def parse_args():
 	sp = subparsers.add_parser('info')
 	sp.add_argument('uuid')
 	sp.set_defaults(command_function=cmd_info)
+
+	sp = subparsers.add_parser('rebuild')
+	sp.set_defaults(command_function=cmd_rebuild)
 	return parser.parse_args()
 
 args = parse_args()
