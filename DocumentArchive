@@ -170,7 +170,7 @@ def cmd_info(args):
 
 def cmd_list(args):
 	def queryquote(v):
-		return v.replace('\\','\\\\').replace('"','\\"')
+		return str(v).replace('\\','\\\\').replace('"','\\"')
 	query = []
 	if args.category is not None:
 		query.append('(category = "{}" or category like "{}/%")'.format(queryquote(args.category), queryquote(args.category).replace('%','\\%')))
