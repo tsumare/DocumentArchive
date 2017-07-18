@@ -171,7 +171,7 @@ def cmd_info(args):
 def cmd_list(args):
 	def queryquote(v):
 		return str(v).replace('\\','\\\\').replace('"','\\"')
-	query = []
+	query = ['S3_Key is not null']
 	if args.category is not None:
 		query.append('(category = "{}" or category like "{}/%")'.format(queryquote(args.category), queryquote(args.category).replace('%','\\%')))
 	if args.relevant_date is not None:
@@ -194,10 +194,7 @@ def cmd_list(args):
 			query.append('title like "{}"'.format(queryquote(args.title).replace('%%','\\%')))
 		else:
 			query.append('title like "%{}%"'.format(queryquote(args.title)))
-	if query:
-		query = 'select * from {} where {}'.format(CONFIG['simpledb_domain'], ' and '.join(query))
-	else:
-		query = 'select * from {}'.format(CONFIG['simpledb_domain'])
+	query = 'select * from {} where {}'.format(CONFIG['simpledb_domain'], ' and '.join(query))
 	try:
 		query = map(parse_attributes, sdb_select(SelectExpression=query))
 	except Exception:
