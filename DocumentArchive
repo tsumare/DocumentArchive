@@ -263,7 +263,7 @@ def cmd_checklist(args):
 
 	fmt  = '{{:{:d}s}}  '.format(max(map(lambda x: len(x), countmap.keys())))
 	fmt += '{:7s}  '*len(periods)
-	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), periods)))
+	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), sorted(periods))))
 	columnized = {}
 	for category, period_counts in countmap.items():
 		columns = columnized.setdefault(category, [])
