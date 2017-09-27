@@ -4,6 +4,7 @@ import base64
 import binascii
 import boto3, botocore
 import calendar
+import collections
 import datetime
 import dateutil.parser
 import hashlib
@@ -217,6 +218,62 @@ def cmd_list(args):
 			archdate=result['archive-date'].strftime('%Y-%m-%d')
 			))
 
+def cmd_checklist(args):
+	def queryquote(v):
+		return str(v).replace('\\','\\\\').replace('"','\\"')
+	query = ['S3_Key is not null']
+	if args.category is not None:
+		query.append('(category = "{}" or category like "{}/%")'.format(queryquote(args.category), queryquote(args.category).replace('%','\\%')))
+	if args.relevant_date is not None:
+		query.append('''
+			(
+				`relevant-date` between "{start_date}" and "{end_date}"
+				or
+				(
+					`relevant-date` is null
+					and
+					`archive-date` between "{start_date}" and "{end_date}"
+				)
+			)'''.format(start_date=queryquote(args.relevant_date[0]), end_date=queryquote(args.relevant_date[1])))
+	if args.archive_date is not None:
+		query.append('`archive-date` between "{}" and "{}"'.format(queryquote(args.archive_date[0]), queryquote(args.archive_date[1])))
+	if args.tag:
+		query.append(' intersection '.join(map(lambda x: 'tags = "{}"'.format(queryquote(x)), set(args.tag))))
+	if args.title is not None:
+		if '%' in args.title:
+			query.append('title like "{}"'.format(queryquote(args.title).replace('%%','\\%')))
+		else:
+			query.append('title like "%{}%"'.format(queryquote(args.title)))
+	query = 'select * from {} where {}'.format(CONFIG['simpledb_domain'], ' and '.join(query))
+	try:
+		query = map(parse_attributes, sdb_select(SelectExpression=query))
+	except Exception:
+		print('Query: {}'.format(query))
+		raise
+	countmap = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
+	periods = set()
+	for item in query:
+		period = item.get('relevant-date', item['archive-date']).replace(day=1)
+		periods.add(period)
+		countmap[item['category']][period] += 1
+
+	if not countmap:
+		print('No results.')
+		return
+
+	fmt  = '{{:{:d}s}}  '.format(max(map(lambda x: len(x), countmap.keys())))
+	fmt += '{:7s}  '*len(periods)
+	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), periods)))
+	columnized = {}
+	for category, period_counts in countmap.items():
+		columns = columnized.setdefault(category, [])
+		for period in sorted(periods):
+			count = countmap[category][period]
+			columns.append({'value': count, 'delta': (count - columns[-1]['value'] if columns else None)})
+
+	for category, columns in sorted(columnized.items(), key=lambda x: sorted(reversed(list(map(lambda x: x['delta'] or 0, x[1]))))):
+		print(fmt.format(category, *map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else '    {value:2d}'.format(**x), columns)))
+
 def cmd_categories(args):
 	categories = map(lambda x: parse_attributes(x)['category'], sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain'])))
 	categories = sorted(set(categories))
@@ -427,6 +484,15 @@ def parse_args():
 	sp.add_argument('--extension', action='store', default=None)
 	sp.add_argument('--archive-date', action='store', type=parse_date_range, default=None)
 	sp.set_defaults(command_function=cmd_list)
+
+	sp = subparsers.add_parser('checklist')
+	sp.add_argument('-c','--category', action='store', default=None)
+	sp.add_argument('-d','--relevant-date', action='store', type=parse_date_range, default=None)
+	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
+	sp.add_argument('-n','--title', action='store', default=None)
+	sp.add_argument('--extension', action='store', default=None)
+	sp.add_argument('--archive-date', action='store', type=parse_date_range, default=None)
+	sp.set_defaults(command_function=cmd_checklist)
 
 	sp = subparsers.add_parser('categories')
 	#sp.add_argument('-c','--category', action='store', default=None)
