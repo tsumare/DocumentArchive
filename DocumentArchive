@@ -261,9 +261,13 @@ def cmd_checklist(args):
 		print('No results.')
 		return
 
+	reflection = list
+	if args.reverse:
+		reflection = reversed
+
 	fmt  = '{{:{:d}s}}  '.format(max(map(lambda x: len(x), countmap.keys())))
 	fmt += '{:7s}  '*len(periods)
-	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), sorted(periods))))
+	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), reflection(sorted(periods)))))
 	columnized = {}
 	for category, period_counts in countmap.items():
 		columns = columnized.setdefault(category, [])
@@ -272,7 +276,7 @@ def cmd_checklist(args):
 			columns.append({'value': count, 'delta': (count - columns[-1]['value'] if columns else None)})
 
 	for category, columns in sorted(columnized.items(), key=lambda x: sorted(reversed(list(map(lambda x: x['delta'] or 0, x[1]))))):
-		print(fmt.format(category, *map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else '    {value:2d}'.format(**x), columns)))
+		print(fmt.format(category, *map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else ('     {value:2d}' if not args.reverse else '{value:2d}      ').format(**x), reflection(columns))))
 
 def cmd_categories(args):
 	categories = map(lambda x: parse_attributes(x)['category'], sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain'])))
@@ -490,6 +494,7 @@ def parse_args():
 	sp.add_argument('-d','--relevant-date', action='store', type=parse_date_range, default=None)
 	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
 	sp.add_argument('-n','--title', action='store', default=None)
+	sp.add_argument('-r','--reverse', action='store_true')
 	sp.add_argument('--extension', action='store', default=None)
 	sp.add_argument('--archive-date', action='store', type=parse_date_range, default=None)
 	sp.set_defaults(command_function=cmd_checklist)
