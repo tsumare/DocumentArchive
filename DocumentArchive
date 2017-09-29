@@ -285,7 +285,7 @@ def cmd_checklist(args):
 			count = countmap[category][period]
 			columns.append({'value': count, 'delta': (count - columns[-1]['value'] if columns else None)})
 
-	for category, columns in sorted(columnized.items(), key=lambda x: sorted(reversed(list(map(lambda x: x['delta'] or 0, x[1]))))):
+	for category, columns in sorted(columnized.items(), key=lambda x: list(reversed(list(map(lambda x: x['delta'] or 0, x[1]))))):
 		fmtargs = [category]
 		fmtargs.extend(map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else ('     {value:2d}' if not args.reverse else '{value:2d}      ').format(**x), reflection(columns)))
 		if args.last:
