@@ -252,10 +252,13 @@ def cmd_checklist(args):
 		raise
 	countmap = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
 	periods = set()
+	period_max = {}
 	for item in query:
-		period = item.get('relevant-date', item['archive-date']).replace(day=1)
+		reldate = item.get('relevant-date', item['archive-date'])
+		period = reldate.replace(day=1)
 		periods.add(period)
 		countmap[item['category']][period] += 1
+		period_max[item['category']] = max(period_max.get(item['category'], reldate), reldate)
 
 	if not countmap:
 		print('No results.')
@@ -267,7 +270,14 @@ def cmd_checklist(args):
 
 	fmt  = '{{:{:d}s}}  '.format(max(map(lambda x: len(x), countmap.keys())))
 	fmt += '{:7s}  '*len(periods)
-	print(fmt.format('', *map(lambda x: x.strftime('%Y-%m'), reflection(sorted(periods)))))
+	if args.last:
+		fmt += '{:10s}  '
+	fmt.strip()
+	fmtargs = ['']
+	fmtargs.extend(map(lambda x: x.strftime('%Y-%m'), reflection(sorted(periods))))
+	if args.last:
+		fmtargs.append('last entry')
+	print(fmt.format(*fmtargs))
 	columnized = {}
 	for category, period_counts in countmap.items():
 		columns = columnized.setdefault(category, [])
@@ -276,7 +286,11 @@ def cmd_checklist(args):
 			columns.append({'value': count, 'delta': (count - columns[-1]['value'] if columns else None)})
 
 	for category, columns in sorted(columnized.items(), key=lambda x: sorted(reversed(list(map(lambda x: x['delta'] or 0, x[1]))))):
-		print(fmt.format(category, *map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else ('     {value:2d}' if not args.reverse else '{value:2d}      ').format(**x), reflection(columns))))
+		fmtargs = [category]
+		fmtargs.extend(map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else ('     {value:2d}' if not args.reverse else '{value:2d}      ').format(**x), reflection(columns)))
+		if args.last:
+			fmtargs.append(period_max[category].strftime('%Y-%m-%d'))
+		print(fmt.format(*fmtargs))
 
 def cmd_categories(args):
 	categories = map(lambda x: parse_attributes(x)['category'], sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain'])))
@@ -495,6 +509,7 @@ def parse_args():
 	sp.add_argument('-t','--tag', action='append', type=parse_tag, default=[])
 	sp.add_argument('-n','--title', action='store', default=None)
 	sp.add_argument('-r','--reverse', action='store_true')
+	sp.add_argument('-l','--last', action='store_true')
 	sp.add_argument('--extension', action='store', default=None)
 	sp.add_argument('--archive-date', action='store', type=parse_date_range, default=None)
 	sp.set_defaults(command_function=cmd_checklist)
