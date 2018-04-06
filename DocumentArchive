@@ -275,7 +275,7 @@ def cmd_checklist(args):
 		print(fmt.format(category, *map(lambda x: '{value:2d} ({delta:+2d})'.format(**x) if x['delta'] is not None else '    {value:2d}'.format(**x), columns)))
 
 def cmd_categories(args):
-	categories = map(lambda x: parse_attributes(x)['category'], sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain'])))
+	categories = filter(lambda x: x is not None, map(lambda x: parse_attributes(x).get('category',None), sdb_select(SelectExpression='select category from {}'.format(CONFIG['simpledb_domain']))))
 	categories = sorted(set(categories))
 	for category in categories:
 		print(category)
