@@ -117,6 +117,46 @@ def cmd_save(args):
 	s3.Bucket(CONFIG['bucket']).Object(item['S3_Key']).download_file(filename)
 	print(filename)
 
+def cmd_backup(args):
+	try:
+		os.mkdir(args.dest)
+	except FileExistsError:
+		pass
+	oldumask = os.umask(0o077)
+	for item in itertools.chain.from_iterable(map(lambda x: x['Contents'], s3client.get_paginator('list_objects_v2').paginate(Bucket=CONFIG['bucket']))):
+		keypath, keybase = os.path.split(item['Key'])
+		keybase, keyext = os.path.splitext(keybase)
+		keymtime = item['LastModified'].strftime('%Y%m%dT%H%M%S')
+		fnfmt = os.path.join(args.dest, '{path}/{base}-content-{{sha}}{ext}'.format(path=keypath, base=keybase, mtime=keymtime, ext=keyext))
+		mdfn = os.path.join(args.dest, '{path}/{base}-metadata-{mtime}.json'.format(path=keypath, base=keybase, mtime=keymtime, ext=keyext))
+		print(mdfn)
+		if os.path.exists(mdfn):
+			try:
+				metadata = json.load(open(mdfn,'r'))
+				if os.path.exists(fnfmt.format(sha=metadata['sha256'])):
+					continue
+			except:
+				pass
+		obj = s3.Object(CONFIG['bucket'], item['Key'])
+		metadata = dict(obj.metadata)
+		if 'uuid' not in metadata:
+			continue
+		metadata['S3_ContentType'] = obj.content_type
+		metadata['S3_Key'] = item['Key']
+		if os.path.exists(mdfn):
+			continue
+		print('{}  {}'.format(metadata['uuid'], item['Key']))
+		if os.path.exists(mdfn):
+			continue
+		pprint.pprint(metadata)
+		os.makedirs(os.path.join(args.dest, keypath), exist_ok=True)
+		json.dump(metadata, open(mdfn+'~','w'), sort_keys=True, indent='\t')
+		if not os.path.exists(fnfmt.format(sha=metadata['sha256'])) or metadata['sha256'] != hashlib.sha256(open(fnfmt.format(sha=metadata['sha256']),'rb').read()).hexdigest():
+			obj.download_file(fnfmt.format(sha=metadata['sha256'])+'~')
+			os.rename(fnfmt.format(sha=metadata['sha256'])+'~', fnfmt.format(sha=metadata['sha256']))
+		os.rename(mdfn+'~', mdfn)
+	os.umask(oldumask)
+
 def cmd_delete(args):
 	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
 	if not item:
@@ -533,6 +573,10 @@ def parse_args():
 	sp.add_argument('uuid')
 	sp.add_argument('-o','--output', action='store', default='{uuid} {original-filename}')
 	sp.set_defaults(command_function=cmd_save)
+
+	sp = subparsers.add_parser('backup')
+	sp.add_argument('dest')
+	sp.set_defaults(command_function=cmd_backup)
 
 	sp = subparsers.add_parser('dElEtE')
 	sp.add_argument('uuid')
