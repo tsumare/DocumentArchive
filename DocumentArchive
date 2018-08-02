@@ -94,6 +94,8 @@ def sdb_select(SelectExpression, count_query=False):
 			break
 
 def cmd_open(args):
+	if '://' in args.uuid:
+		args.uuid = args.uuid.split('://',1)[1]
 	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
 	if not item:
 		print('UUID not known')
@@ -470,6 +472,24 @@ def cmd_tweak(args):
 		if (oldobj.bucket_name, oldobj.key) != (newobj.bucket_name, newobj.key):
 			oldobj.delete()
 
+def cmd_install_urlhandler(args):
+	with open('/tmp/tsumare-documentarchive.desktop','w') as fd:
+		contents = '''
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec={binary} open %u
+Icon=vncviewer
+StartupNotify=true
+Terminal=false
+Categories=Utility;X-XFCE;X-Xfce-Toplevel;
+MimeType=x-scheme-handler/document-archive
+Name=DocumentArchive Open
+Comment=DocumentArchive Open
+'''
+		fd.write(contents.format(binary=os.path.abspath(sys.argv[0])))
+	subprocess.call(['xdg-desktop-menu', 'install', '/tmp/tsumare-documentarchive.desktop'])
+
 def parse_args():
 	parser = argparse.ArgumentParser()
 	subparsers = parser.add_subparsers(dest='command')
@@ -585,6 +605,9 @@ def parse_args():
 	sp = subparsers.add_parser('info')
 	sp.add_argument('uuid')
 	sp.set_defaults(command_function=cmd_info)
+
+	sp = subparsers.add_parser('install-urlhandler')
+	sp.set_defaults(command_function=cmd_install_urlhandler)
 
 	sp = subparsers.add_parser('rebuild')
 	sp.set_defaults(command_function=cmd_rebuild)
