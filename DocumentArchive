@@ -27,15 +27,82 @@ except Exception as e:
 	print('Config format:')
 	print(json.dumps({
 		'bucket': 'bucket.for.archive',
+		'simpledb_domain': 'domain',
 		'pastebucket': 'optional bucket for generating short urls, else: delete or set to null',
+		'2fa_device': None,
+		'2fa_remember_seconds': 0,
+		'2fa_yubioath_label': None,
+		'2fa_except_presign': False,
+		'aws_access_key_id': None,
+		'aws_secret_access_key': None,
+		'aws_session_token': None,
 		}, indent='\t'))
 	print()
 	sys.exit(1)
 
+DEFAULT_CREDS = {}
+for i in ('aws_access_key_id', 'aws_secret_access_key', 'aws_session_token'):
+	if CONFIG.get(i, None):
+		DEFAULT_CREDS[i] = CONFIG[i]
+
 s3session = boto3.Session()
-s3client = s3session.client('s3')
+s3client = s3session.client('s3', **DEFAULT_CREDS)
 s3 = s3session.resource('s3')
-sdb = s3session.client('sdb')
+sdb = s3session.client('sdb', **DEFAULT_CREDS)
+
+s3client_presign = s3client
+
+if CONFIG.get('2fa_device', None) and 'AWS_SESSION_TOKEN' not in os.environ:
+	creds = None
+	if CONFIG.get('2fa_remember_seconds', 0):
+		try:
+			with open('/var/run/user/{}/documentarchive.2fa.json'.format(os.getuid()),'r') as fd:
+				creds = json.load(fd)
+		except FileNotFoundError:
+			pass
+	if creds:
+		# Validate creds
+		try:
+			stsclient = s3session.client('sts', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
+			if 'Account' not in stsclient.get_caller_identity():
+				creds = None
+		except Exception as e:
+			print('"{}" validating saved credentials.  Discarding.'.format(e), file=sys.stderr)
+			creds = None
+	if not creds:
+		code = None
+		if CONFIG.get('2fa_yubioath_label', None):
+			try:
+				code = subprocess.check_output(['ykman', 'oath', 'code', '-s', CONFIG['2fa_yubioath_label']], timeout=20).decode('ascii').strip()
+			except subprocess.CalledProcessError:
+				print('Error in YubiKey operation.', file=sys.stderr)
+			except TimeoutError:
+				print('Timed out waiting for YubiKey operation.', file=sys.stderr)
+		if not code:
+			print('Enter your 2FA code: ', file=sys.stderr, end='', flush=True)
+			code = sys.stdin.readline().strip()
+		stsclient = s3session.client('sts', **DEFAULT_CREDS)
+		creds = stsclient.get_session_token(
+				DurationSeconds=CONFIG.get('2fa_remember_seconds',0) or 900,
+				SerialNumber=CONFIG['2fa_device'],
+				TokenCode=code,
+				)
+		creds = {
+				'AWS_ACCESS_KEY_ID': creds['Credentials']['AccessKeyId'],
+				'AWS_SECRET_ACCESS_KEY': creds['Credentials']['SecretAccessKey'],
+				'AWS_SESSION_TOKEN': creds['Credentials']['SessionToken'],
+				'Expiration': creds['Credentials']['Expiration'].strftime('%Y-%m-%dT%H:%M:%S%z'),
+				}
+		try:
+			with open('/var/run/user/{}/documentarchive.2fa.json'.format(os.getuid()),'w') as fd:
+				json.dump(creds, fd)
+		except OSError:
+			pass
+	s3client = s3session.client('s3', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
+	s3 = s3session.resource('s3')
+	sdb = s3session.client('sdb', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
+	if not CONFIG.get('2fa_except_presign', False):
+		s3client_presign = s3client
 
 def cmd_rebuild(args):
 	sdb.delete_domain(DomainName=CONFIG['simpledb_domain'])
@@ -100,7 +167,7 @@ def cmd_open(args):
 	if not item:
 		print('UUID not known')
 		return
-	url = s3client.generate_presigned_url('get_object', Params={
+	url = s3client_presign.generate_presigned_url('get_object', Params={
 		'Bucket': CONFIG['bucket'],
 		'Key': item['S3_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
@@ -172,7 +239,7 @@ def cmd_geturl(args):
 	if not item:
 		print('UUID not known')
 		return
-	url = s3client.generate_presigned_url('get_object', Params={
+	url = s3client_presign.generate_presigned_url('get_object', Params={
 		'Bucket': CONFIG['bucket'],
 		'Key': item['S3_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
