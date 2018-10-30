@@ -47,7 +47,7 @@ for i in ('aws_access_key_id', 'aws_secret_access_key', 'aws_session_token'):
 
 s3session = boto3.Session()
 s3client = s3session.client('s3', **DEFAULT_CREDS)
-s3 = s3session.resource('s3')
+s3 = s3session.resource('s3', **DEFAULT_CREDS)
 sdb = s3session.client('sdb', **DEFAULT_CREDS)
 
 s3client_presign = s3client
@@ -99,7 +99,7 @@ if CONFIG.get('2fa_device', None) and 'AWS_SESSION_TOKEN' not in os.environ:
 		except OSError:
 			pass
 	s3client = s3session.client('s3', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
-	s3 = s3session.resource('s3')
+	s3 = s3session.resource('s3', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
 	sdb = s3session.client('sdb', aws_access_key_id=creds['AWS_ACCESS_KEY_ID'], aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'], aws_session_token=creds.get('AWS_SESSION_TOKEN',None))
 	if not CONFIG.get('2fa_except_presign', False):
 		s3client_presign = s3client
