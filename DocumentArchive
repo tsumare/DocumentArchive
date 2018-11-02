@@ -67,7 +67,8 @@ if CONFIG.get('2fa_device', None) and 'AWS_SESSION_TOKEN' not in os.environ:
 			if 'Account' not in stsclient.get_caller_identity():
 				creds = None
 		except Exception as e:
-			print('"{}" validating saved credentials.  Discarding.'.format(e), file=sys.stderr)
+			if 'The security token included in the request is expired' not in str(e):
+				print('"{}" validating saved credentials.  Discarding.'.format(e), file=sys.stderr)
 			creds = None
 	if not creds:
 		code = None
