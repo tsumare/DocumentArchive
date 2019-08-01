@@ -77,6 +77,8 @@ if CONFIG.get('2fa_device', None) and 'AWS_SESSION_TOKEN' not in os.environ:
 				code = subprocess.check_output(['ykman', 'oath', 'code', '-s', CONFIG['2fa_yubioath_label']], timeout=20).decode('ascii').strip()
 			except subprocess.CalledProcessError:
 				print('Error in YubiKey operation.', file=sys.stderr)
+			except OSError:
+				print('Unable to query YubiKey.', file=sys.stderr)
 			except TimeoutError:
 				print('Timed out waiting for YubiKey operation.', file=sys.stderr)
 		if not code:
