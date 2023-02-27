@@ -175,7 +175,13 @@ def cmd_open(args):
 		'Key': item['S3_Key'],
 		'ResponseContentDisposition': 'filename="{0}"'.format(item['original-filename']),
 		}, ExpiresIn=300)
-	subprocess.call(['xdg-open', url])
+	if 'DISPLAY' in os.environ:
+		try:
+			subprocess.call(['xdg-open', url])
+			return
+		except Exception:
+			pass
+	print(url)
 
 def cmd_save(args):
 	item = parse_attributes(sdb.get_attributes(DomainName=CONFIG['simpledb_domain'], ItemName=args.uuid))
